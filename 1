@@ -17,11 +17,41 @@ error() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
 # ====================== Проверки ======================
 [[ $EUID -ne 0 ]] && error "Запускай от root"
 
+if ! command -v apt-get &> /dev/null; then
+    error "Этот скрипт предназначен только для Debian/Ubuntu"
+fi
+
 export DEBIAN_FRONTEND=noninteractive
 
-info "Обновляю пакеты и ставлю зависимости..."
+# ====================== Полная защита сервера ======================
+info "Настройка максимальной безопасности сервера..."
+info "Устанавливаю fail2ban и unattended-upgrades..."
 apt-get update -qq
-apt-get install -y -qq curl openssl ca-certificates > /dev/null
+apt-get install -y -qq curl openssl ca-certificates fail2ban unattended-upgrades > /dev/null
+
+# Настройка автоматических обновлений безопасности
+echo 'Unattended-Upgrade::Allowed-Origins:: "${distro_id}:${distro_codename}-security";' > /etc/apt/apt.conf.d/50unattended-upgrades
+systemctl enable --now unattended-upgrades
+systemctl enable --now fail2ban
+
+# Спрашиваем про отключение SSH
+echo
+warn "⚠️  ВНИМАНИЕ: Ты можешь полностью отключить SSH-сервер."
+warn "После этого войти на сервер можно будет ТОЛЬКО через VNC/веб-консоль хостинга."
+warn "Убедись, что ты знаешь root-пароль и консоль хостинга работает исправно!"
+read -p "Отключить SSH полностью? (y/N): " DISABLE_SSH
+if [[ "$DISABLE_SSH" =~ ^[Yy]$ ]]; then
+    info "Останавливаю и отключаю SSH..."
+    systemctl stop sshd || true
+    systemctl disable sshd || true
+    # Блокируем порт 22 на уровне фаервола на всякий случай
+    if command -v ufw &>/dev/null; then
+        ufw deny 22/tcp > /dev/null 2>&1 || true
+    fi
+    ok "SSH полностью отключен."
+else
+    info "SSH оставлен включенным. Настоятельно рекомендую использовать SSH-ключи вместо пароля!"
+fi
 
 # ====================== Выбор порта ======================
 echo
@@ -33,16 +63,24 @@ PORT_CHOICE=${PORT_CHOICE:-1}
 
 if [[ "$PORT_CHOICE" == "2" ]]; then
     read -p "Введи UDP порт (30000-60000): " HY2_PORT
-    [[ -z "${HY2_PORT}" || "${HY2_PORT}" -lt 1024 || "${HY2_PORT}" -gt 65535 ]] && error "Некорректный порт"
+    [[ -z "${HY2_PORT}" || "${HY2_PORT}" -lt 30000 || "${HY2_PORT}" -gt 60000 ]] && error "Некорректный порт. Используйте диапазон 30000-60000"
 else
     HY2_PORT=$((RANDOM % 25000 + 35000))
 fi
 
 ok "Порт: ${HY2_PORT}/udp"
 
-# ====================== Генерация паролей ======================
-AUTH_PASS=$(openssl rand -base64 32 | tr -d '/+=' | head -c 32)
+# ====================== Генерация данных для 4-х клиентов ======================
+info "Генерирую уникальные данные для 4-х клиентов..."
 OBFS_PASS=$(openssl rand -base64 32 | tr -d '/+=' | head -c 32)
+
+declare -a CLIENT_NAMES=("client1" "client2" "client3" "client4")
+declare -a CLIENT_PASSES=()
+
+for i in {0..3}; do
+    # Генерируем пароль без спецсимволов, чтобы он был безопасен для URL
+    CLIENT_PASSES+=("$(openssl rand -base64 32 | tr -d '/+=' | head -c 32)")
+done
 
 # ====================== Установка Hysteria2 ======================
 info "Устанавливаю Hysteria2..."
@@ -55,7 +93,8 @@ bash <(curl -fsSL https://get.hy2.sh/) > /tmp/hy2-install.log 2>&1 || {
 info "Создаю сертификат и настраиваю права..."
 
 mkdir -p /etc/hysteria
-rm -f /etc/hysteria/server.key /etc/hysteria/server.crt
+# Очищаем старые файлы для безопасного повторного запуска
+rm -f /etc/hysteria/server.key /etc/hysteria/server.crt /etc/hysteria/config.yaml
 
 openssl req -x509 -nodes -newkey rsa:2048 \
     -keyout /etc/hysteria/server.key \
@@ -63,14 +102,13 @@ openssl req -x509 -nodes -newkey rsa:2048 \
     -days 3650 \
     -subj "/CN=www.microsoft.com" 2>/dev/null
 
-# Важно: правильные права для пользователя hysteria
 chown -R hysteria:hysteria /etc/hysteria
 chmod 700 /etc/hysteria
 chmod 600 /etc/hysteria/server.key
 chmod 644 /etc/hysteria/server.crt
 
 # ====================== Конфиг ======================
-info "Пишу конфиг..."
+info "Пишу конфиг с поддержкой 4-х пользователей..."
 
 cat > /etc/hysteria/config.yaml << EOF
 listen: :${HY2_PORT}
@@ -80,8 +118,12 @@ tls:
   key: /etc/hysteria/server.key
 
 auth:
-  type: password
-  password: ${AUTH_PASS}
+  type: userpass
+  userpass:
+    ${CLIENT_NAMES[0]}: ${CLIENT_PASSES[0]}
+    ${CLIENT_NAMES[1]}: ${CLIENT_PASSES[1]}
+    ${CLIENT_NAMES[2]}: ${CLIENT_PASSES[2]}
+    ${CLIENT_NAMES[3]}: ${CLIENT_PASSES[3]}
 
 obfs:
   type: salamander
@@ -126,7 +168,10 @@ info "Настраиваю firewall..."
 
 if command -v ufw &>/dev/null; then
     ufw allow "${HY2_PORT}/udp" > /dev/null
-    ufw allow 22/tcp > /dev/null
+    # Если SSH не отключен, оставляем 22/tcp, иначе он уже заблокирован выше
+    if [[ ! "$DISABLE_SSH" =~ ^[Yy]$ ]]; then
+        ufw allow 22/tcp > /dev/null
+    fi
     ufw --force enable > /dev/null 2>&1 || true
     ok "UFW: порт ${HY2_PORT}/udp открыт"
 elif command -v firewall-cmd &>/dev/null; then
@@ -138,23 +183,40 @@ else
 fi
 
 # ====================== IP сервера ======================
-SERVER_IP=$(curl -s4 --max-time 5 ifconfig.me || curl -s4 --max-time 5 icanhazip.com || curl -s4 --max-time 5 ip.sb || echo "НЕ_УДАЛОСЬ_ОПРЕДЕЛИТЬ")
+# Убрал жесткий флаг -s4, чтобы скрипт работал и на IPv6-серверах
+SERVER_IP=$(curl -s --max-time 5 ifconfig.me || curl -s --max-time 5 icanhazip.com || curl -s --max-time 5 ip.sb || echo "НЕ_УДАЛОСЬ_ОПРЕДЕЛИТЬ")
 
 # ====================== Сохраняем данные ======================
 INFO_FILE="/root/hy2-info.txt"
 
 cat > "${INFO_FILE}" << EOF
-Hysteria2 Configuration
-=======================
+Hysteria2 Configuration (4 Clients)
+====================================
 Date: $(date)
 Server IP: ${SERVER_IP}
 Port: ${HY2_PORT}
-Auth Password: ${AUTH_PASS}
 Obfs Password: ${OBFS_PASS}
 SNI: www.microsoft.com
 
-URI:
-hysteria2://${AUTH_PASS}@${SERVER_IP}:${HY2_PORT}/?obfs=salamander&obfs-password=${OBFS_PASS}&sni=www.microsoft.com&insecure=1
+--- Client 1 ---
+Name: ${CLIENT_NAMES[0]}
+Password: ${CLIENT_PASSES[0]}
+URI: hysteria2://${CLIENT_NAMES[0]}:${CLIENT_PASSES[0]}@${SERVER_IP}:${HY2_PORT}/?obfs=salamander&obfs-password=${OBFS_PASS}&sni=www.microsoft.com&insecure=1
+
+--- Client 2 ---
+Name: ${CLIENT_NAMES[1]}
+Password: ${CLIENT_PASSES[1]}
+URI: hysteria2://${CLIENT_NAMES[1]}:${CLIENT_PASSES[1]}@${SERVER_IP}:${HY2_PORT}/?obfs=salamander&obfs-password=${OBFS_PASS}&sni=www.microsoft.com&insecure=1
+
+--- Client 3 ---
+Name: ${CLIENT_NAMES[2]}
+Password: ${CLIENT_PASSES[2]}
+URI: hysteria2://${CLIENT_NAMES[2]}:${CLIENT_PASSES[2]}@${SERVER_IP}:${HY2_PORT}/?obfs=salamander&obfs-password=${OBFS_PASS}&sni=www.microsoft.com&insecure=1
+
+--- Client 4 ---
+Name: ${CLIENT_NAMES[3]}
+Password: ${CLIENT_PASSES[3]}
+URI: hysteria2://${CLIENT_NAMES[3]}:${CLIENT_PASSES[3]}@${SERVER_IP}:${HY2_PORT}/?obfs=salamander&obfs-password=${OBFS_PASS}&sni=www.microsoft.com&insecure=1
 EOF
 
 chmod 600 "${INFO_FILE}"
@@ -164,29 +226,36 @@ clear
 echo -e "${GREEN}"
 echo "============================================================"
 echo "          Hysteria2 успешно установлен и запущен"
+echo "          Сервер максимально защищен"
 echo "============================================================"
 echo -e "${NC}"
 
+if [[ "$DISABLE_SSH" =~ ^[Yy]$ ]]; then
+    echo -e "${RED}⚠️  ВНИМАНИЕ: SSH ПОЛНОСТЬЮ ОТКЛЮЧЕН! ⚠️${NC}"
+    echo -e "${RED}Управление сервером теперь возможно ТОЛЬКО через веб-консоль хостинга.${NC}"
+    echo
+fi
+
 echo -e "${CYAN}Сервер:${NC}       ${SERVER_IP}"
 echo -e "${CYAN}Порт:${NC}         ${HY2_PORT} (UDP)"
-echo -e "${CYAN}Auth пароль:${NC}  ${AUTH_PASS}"
 echo -e "${CYAN}Obfs пароль:${NC}  ${OBFS_PASS}"
 echo -e "${CYAN}SNI:${NC}          www.microsoft.com"
 echo
-echo -e "${YELLOW}Важно:${NC} В клиенте обязательно включи Insecure / Skip Certificate Verify"
-echo
 
-echo -e "${GREEN}=== Быстрая ссылка ===${NC}"
-echo "hysteria2://${AUTH_PASS}@${SERVER_IP}:${HY2_PORT}/?obfs=salamander&obfs-password=${OBFS_PASS}&sni=www.microsoft.com&insecure=1"
-echo
-
-echo -e "${GREEN}=== JSON для клиентов ===${NC}"
-cat << EOF
+for i in {0..3}; do
+    echo -e "${GREEN}=== Клиент $(($i+1)) (${CLIENT_NAMES[$i]}) ===${NC}"
+    echo -e "${CYAN}Пароль:${NC} ${CLIENT_PASSES[$i]}"
+    echo -e "${CYAN}URI (для быстрого импорта):${NC}"
+    echo "hysteria2://${CLIENT_NAMES[$i]}:${CLIENT_PASSES[$i]}@${SERVER_IP}:${HY2_PORT}/?obfs=salamander&obfs-password=${OBFS_PASS}&sni=www.microsoft.com&insecure=1"
+    echo
+    
+    echo -e "${CYAN}JSON для Hiddify (вручную):${NC}"
+    cat << EOF
 {
   "type": "hysteria2",
   "server": "${SERVER_IP}",
   "server_port": ${HY2_PORT},
-  "password": "${AUTH_PASS}",
+  "password": "${CLIENT_PASSES[$i]}",
   "obfs": {
     "type": "salamander",
     "password": "${OBFS_PASS}"
@@ -200,7 +269,10 @@ cat << EOF
   "down_mbps": 500
 }
 EOF
+    echo "------------------------------------------------------------"
+done
 
+echo -e "${YELLOW}Важно:${NC} В клиенте (Hiddify) обязательно включи Insecure / Skip Certificate Verify"
 echo
 echo -e "${CYAN}Данные также сохранены в:${NC} ${INFO_FILE}"
 echo
@@ -210,4 +282,3 @@ echo "  journalctl -u hysteria-server -f"
 echo "  cat /root/hy2-info.txt"
 echo
 echo -e "${GREEN}Готово.${NC}"
-echo
