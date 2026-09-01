@@ -44,7 +44,6 @@ if [[ "$DISABLE_SSH" =~ ^[Yy]$ ]]; then
     info "Останавливаю и отключаю SSH..."
     systemctl stop sshd || true
     systemctl disable sshd || true
-    # Блокируем порт 22 на уровне фаервола на всякий случай
     if command -v ufw &>/dev/null; then
         ufw deny 22/tcp > /dev/null 2>&1 || true
     fi
@@ -78,7 +77,6 @@ declare -a CLIENT_NAMES=("client1" "client2" "client3" "client4")
 declare -a CLIENT_PASSES=()
 
 for i in {0..3}; do
-    # Генерируем пароль без спецсимволов, чтобы он был безопасен для URL
     CLIENT_PASSES+=("$(openssl rand -base64 32 | tr -d '/+=' | head -c 32)")
 done
 
@@ -93,7 +91,6 @@ bash <(curl -fsSL https://get.hy2.sh/) > /tmp/hy2-install.log 2>&1 || {
 info "Создаю сертификат и настраиваю права..."
 
 mkdir -p /etc/hysteria
-# Очищаем старые файлы для безопасного повторного запуска
 rm -f /etc/hysteria/server.key /etc/hysteria/server.crt /etc/hysteria/config.yaml
 
 openssl req -x509 -nodes -newkey rsa:2048 \
@@ -108,10 +105,10 @@ chmod 600 /etc/hysteria/server.key
 chmod 644 /etc/hysteria/server.crt
 
 # ====================== Конфиг ======================
-info "Пишу конфиг с поддержкой 4-х пользователей..."
+info "Пишу конфиг с поддержкой 4-х пользователей (Строго IPv4)..."
 
 cat > /etc/hysteria/config.yaml << EOF
-listen: :${HY2_PORT}
+listen: 0.0.0.0:${HY2_PORT}
 
 tls:
   cert: /etc/hysteria/server.crt
@@ -168,7 +165,6 @@ info "Настраиваю firewall..."
 
 if command -v ufw &>/dev/null; then
     ufw allow "${HY2_PORT}/udp" > /dev/null
-    # Если SSH не отключен, оставляем 22/tcp, иначе он уже заблокирован выше
     if [[ ! "$DISABLE_SSH" =~ ^[Yy]$ ]]; then
         ufw allow 22/tcp > /dev/null
     fi
@@ -182,16 +178,24 @@ else
     warn "Firewall не найден. Открой порт ${HY2_PORT}/udp вручную!"
 fi
 
-# ====================== IP сервера ======================
-# Убрал жесткий флаг -s4, чтобы скрипт работал и на IPv6-серверах
-SERVER_IP=$(curl -s --max-time 5 ifconfig.me || curl -s --max-time 5 icanhazip.com || curl -s --max-time 5 ip.sb || echo "НЕ_УДАЛОСЬ_ОПРЕДЕЛИТЬ")
+# ====================== ОПРЕДЕЛЕНИЕ IPv4 АДРЕСА (Строгое) ======================
+info "Определяю публичный IPv4-адрес сервера..."
+# Флаг -4 принудительно запрашивает только IPv4
+SERVER_IP=$(curl -4s --max-time 5 ifconfig.me || curl -4s --max-time 5 api.ipify.org || curl -4s --max-time 5 icanhazip.com)
+
+# Проверка, что полученный адрес действительно похож на IPv4
+if [[ -z "$SERVER_IP" || ! "$SERVER_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    error "Не удалось определить корректный IPv4-адрес. Возможно, у сервера нет публичного IPv4 или есть проблемы с сетью."
+fi
+
+ok "IPv4-адрес сервера: ${SERVER_IP}"
 
 # ====================== Сохраняем данные ======================
 INFO_FILE="/root/hy2-info.txt"
 
 cat > "${INFO_FILE}" << EOF
-Hysteria2 Configuration (4 Clients)
-====================================
+Hysteria2 Configuration (4 Clients, IPv4 Only)
+==============================================
 Date: $(date)
 Server IP: ${SERVER_IP}
 Port: ${HY2_PORT}
@@ -226,7 +230,7 @@ clear
 echo -e "${GREEN}"
 echo "============================================================"
 echo "          Hysteria2 успешно установлен и запущен"
-echo "          Сервер максимально защищен"
+echo "          Сервер максимально защищен (IPv4)"
 echo "============================================================"
 echo -e "${NC}"
 
@@ -236,7 +240,7 @@ if [[ "$DISABLE_SSH" =~ ^[Yy]$ ]]; then
     echo
 fi
 
-echo -e "${CYAN}Сервер:${NC}       ${SERVER_IP}"
+echo -e "${CYAN}Сервер (IPv4):${NC} ${SERVER_IP}"
 echo -e "${CYAN}Порт:${NC}         ${HY2_PORT} (UDP)"
 echo -e "${CYAN}Obfs пароль:${NC}  ${OBFS_PASS}"
 echo -e "${CYAN}SNI:${NC}          www.microsoft.com"
