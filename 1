@@ -11,26 +11,29 @@ error() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
 command -v apt-get &>/dev/null || error "Только Debian/Ubuntu"
 export DEBIAN_FRONTEND=noninteractive
 
-info "Настройка безопасности и установка зависимостей..."
+# ====================== Защита сервера ======================
+info "Настройка безопасности..."
 apt-get update -qq
 apt-get install -y -qq curl openssl ca-certificates fail2ban unattended-upgrades > /dev/null
 echo 'Unattended-Upgrade::Allowed-Origins:: "${distro_id}:${distro_codename}-security";' > /etc/apt/apt.conf.d/50unattended-upgrades
 systemctl enable --now unattended-upgrades fail2ban
 
-warn "⚠️ ВНИМАНИЕ: Отключить SSH? (Вход только через VNC хостинга)"
+echo
+warn "⚠️  ВНИМАНИЕ: Отключить SSH полностью? (Вход только через VNC хостинга)"
 read -p "Отключить SSH? (y/N): " DISABLE_SSH
 if [[ "$DISABLE_SSH" =~ ^[Yy]$ ]]; then
     systemctl stop sshd || true; systemctl disable sshd || true
     command -v ufw &>/dev/null && ufw deny 22/tcp > /dev/null 2>&1 || true
     ok "SSH отключен."
 else
-    info "SSH оставлен. Используй SSH-ключи!"
+    info "SSH оставлен. Используй SSH-ключи вместо пароля!"
 fi
 
-# ЖЕСТКАЯ УСТАНОВКА ПОРТА 443
+# ====================== Порт ======================
 HY2_PORT=443
-ok "Порт жестко установлен на: ${HY2_PORT}/udp (для обхода блокировок)"
+ok "Порт: ${HY2_PORT}/udp (жестко установлен для обхода блокировок)"
 
+# ====================== Пароли для 4-х клиентов ======================
 info "Генерация данных для 4-х клиентов..."
 OBFS_PASS=$(openssl rand -base64 32 | tr -d '/+=' | head -c 32)
 declare -a CLIENT_NAMES=("client1" "client2" "client3" "client4")
@@ -39,9 +42,11 @@ for i in {0..3}; do
     CLIENT_PASSES+=("$(openssl rand -base64 32 | tr -d '/+=' | head -c 32)")
 done
 
+# ====================== Установка Hysteria2 ======================
 info "Установка Hysteria2..."
 bash <(curl -fsSL https://get.hy2.sh/) > /tmp/hy2-install.log 2>&1 || { cat /tmp/hy2-install.log; error "Ошибка установки"; }
 
+# ====================== Сертификат ======================
 info "Создание сертификата..."
 mkdir -p /etc/hysteria
 rm -f /etc/hysteria/server.key /etc/hysteria/server.crt /etc/hysteria/config.yaml
@@ -49,10 +54,11 @@ openssl req -x509 -nodes -newkey rsa:2048 -keyout /etc/hysteria/server.key -out 
 chown -R hysteria:hysteria /etc/hysteria
 chmod 700 /etc/hysteria; chmod 600 /etc/hysteria/server.key; chmod 644 /etc/hysteria/server.crt
 
-info "Вычисление SHA256 отпечатка для Xray-core..."
+info "Вычисление SHA256 отпечатка (для строгих клиентов)..."
 PIN_SHA256=$(openssl x509 -in /etc/hysteria/server.crt -noout -fingerprint -sha256 | sed 's/.*=//;s/://g')
-ok "Отпечаток: ${PIN_SHA256:0:16}..."
+ok "Отпечаток получен"
 
+# ====================== Конфиг ======================
 info "Запись конфига..."
 cat > /etc/hysteria/config.yaml << EOF
 listen: 0.0.0.0:${HY2_PORT}
@@ -82,53 +88,68 @@ ignoreClientBandwidth: false
 EOF
 chown hysteria:hysteria /etc/hysteria/config.yaml; chmod 600 /etc/hysteria/config.yaml
 
+# ====================== Запуск сервиса ======================
 info "Запуск сервиса..."
 systemctl daemon-reload; systemctl enable hysteria-server > /dev/null; systemctl restart hysteria-server
 sleep 2
 systemctl is-active --quiet hysteria-server || { journalctl -u hysteria-server -n 20 --no-pager; error "Сервис не запустился"; }
 ok "Hysteria2 запущен"
 
+# ====================== Фаервол ======================
 info "Настройка фаервола..."
 if command -v ufw &>/dev/null; then
     ufw allow "${HY2_PORT}/udp" > /dev/null
     [[ ! "$DISABLE_SSH" =~ ^[Yy]$ ]] && ufw allow 22/tcp > /dev/null
     ufw --force enable > /dev/null 2>&1 || true
     ok "UFW настроен"
+elif command -v firewall-cmd &>/dev/null; then
+    firewall-cmd --permanent --add-port="${HY2_PORT}/udp" > /dev/null
+    firewall-cmd --reload > /dev/null
+    ok "firewalld настроен"
+else
+    warn "Firewall не найден. Открой ${HY2_PORT}/udp вручную!"
 fi
 
+# ====================== IP ======================
 info "Определение IPv4..."
 SERVER_IP=$(curl -4s --max-time 5 ifconfig.me || curl -4s --max-time 5 api.ipify.org || curl -4s --max-time 5 icanhazip.com)
 [[ -z "$SERVER_IP" || ! "$SERVER_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && error "Не удалось определить IPv4"
 ok "IPv4: ${SERVER_IP}"
 
+# ====================== Сохранение ======================
 INFO_FILE="/root/hy2-info.txt"
 cat > "${INFO_FILE}" << EOF
-Hysteria2 (Port 443, with pinSHA256 for Xray-core)
-==================================================
-Server IP: ${SERVER_IP}
+Hysteria2 (Port 443, with pinSHA256)
+====================================
+Server: ${SERVER_IP}
 Port: ${HY2_PORT}
-Obfs Password: ${OBFS_PASS}
+Obfs: ${OBFS_PASS}
 Cert SHA256: ${PIN_SHA256}
 EOF
 for i in {0..3}; do
-    echo "Client $(($i+1)) Pass: ${CLIENT_PASSES[$i]}" >> "${INFO_FILE}"
+    echo "${CLIENT_NAMES[$i]}: ${CLIENT_PASSES[$i]}" >> "${INFO_FILE}"
 done
 chmod 600 "${INFO_FILE}"
 
+# ====================== Вывод ======================
 clear
 echo -e "${GREEN}============================================================${NC}"
-echo -e "${GREEN}          HYSTERIA2 УСПЕШНО УСТАНОВЛЕН (ПОРТ 443)${NC}"
-echo -e "${GREEN}          Конфиги оптимизированы для v2rayN/NekoRay${NC}"
+echo -e "${GREEN}      HYSTERIA2 УСПЕШНО УСТАНОВЛЕН (ПОРТ 443)${NC}"
 echo -e "${GREEN}============================================================${NC}"
 echo -e "${CYAN}Сервер:${NC} ${SERVER_IP}"
 echo -e "${CYAN}Порт:${NC}   ${HY2_PORT} (UDP)"
 echo -e "${CYAN}Obfs:${NC}   ${OBFS_PASS}"
+echo -e "${CYAN}SHA256:${NC} ${PIN_SHA256}"
 echo
 
 for i in {0..3}; do
-    echo -e "${GREEN}=== Клиент $(($i+1)) ===${NC}"
+    echo -e "${GREEN}=== Клиент $(($i+1)) (${CLIENT_NAMES[$i]}) ===${NC}"
     echo -e "${CYAN}Пароль:${NC} ${CLIENT_PASSES[$i]}"
-    echo -e "${YELLOW}⚠️ ДЛЯ v2rayN / NekoRay (Xray-core) ИСПОЛЬЗУЙ ТОЛЬКО ЭТОТ JSON:⚠️${NC}"
+    echo
+    echo -e "${YELLOW}📱 URI-ССЫЛКА (для Hiddify / Shadowrocket / Karing / SingBox):${NC}"
+    echo "hysteria2://${CLIENT_NAMES[$i]}:${CLIENT_PASSES[$i]}@${SERVER_IP}:${HY2_PORT}/?obfs=salamander&obfs-password=${OBFS_PASS}&sni=www.microsoft.com&insecure=1"
+    echo
+    echo -e "${YELLOW}🔧 JSON (для v2rayN / NekoRay с pinSHA256):${NC}"
     cat << EOF
 {
   "type": "hysteria2",
@@ -151,5 +172,12 @@ for i in {0..3}; do
 EOF
     echo "------------------------------------------------------------"
 done
-echo -e "${CYAN}Данные сохранены в: /root/hy2-info.txt${NC}"
+
+echo -e "${CYAN}Данные сохранены в:${NC} ${INFO_FILE}"
+echo
+echo -e "${GREEN}Полезные команды:${NC}"
+echo "  systemctl status hysteria-server"
+echo "  journalctl -u hysteria-server -f"
+echo "  cat /root/hy2-info.txt"
+echo
 echo -e "${GREEN}Готово.${NC}"
