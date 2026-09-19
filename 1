@@ -59,7 +59,6 @@ PORT_CHOICE=${PORT_CHOICE:-1}
 
 if [[ "$PORT_CHOICE" == "2" ]]; then
     read -p "Введи UDP порт (443 или 30000-60000): " HY2_PORT
-    # Разрешаем порт 443 ИЛИ диапазон 30000-60000
     if [[ "$HY2_PORT" != "443" ]] && { [[ "${HY2_PORT}" -lt 30000 ]] || [[ "${HY2_PORT}" -gt 60000 ]]; }; then
         error "Некорректный порт. Используйте 443 или диапазон 30000-60000"
     fi
@@ -103,6 +102,11 @@ chown -R hysteria:hysteria /etc/hysteria
 chmod 700 /etc/hysteria
 chmod 600 /etc/hysteria/server.key
 chmod 644 /etc/hysteria/server.crt
+
+# ====================== Вычисление SHA256 отпечатка сертификата ======================
+info "Вычисляю SHA256 отпечаток сертификата для совместимости с новыми клиентами..."
+PIN_SHA256=$(openssl x509 -in /etc/hysteria/server.crt -noout -fingerprint -sha256 | sed 's/.*=//;s/://g')
+ok "Отпечаток получен: ${PIN_SHA256:0:16}..."
 
 # ====================== Конфиг ======================
 info "Пишу конфиг с поддержкой 4-х пользователей..."
@@ -192,13 +196,14 @@ ok "IPv4-адрес сервера: ${SERVER_IP}"
 INFO_FILE="/root/hy2-info.txt"
 
 cat > "${INFO_FILE}" << EOF
-Hysteria2 Configuration (4 Clients, IPv4 Only)
-==============================================
+Hysteria2 Configuration (4 Clients, IPv4 Only, with SHA256 Pinning)
+===================================================================
 Date: $(date)
 Server IP: ${SERVER_IP}
 Port: ${HY2_PORT}
 Obfs Password: ${OBFS_PASS}
 SNI: www.microsoft.com
+Cert SHA256: ${PIN_SHA256}
 
 --- Client 1 ---
 Name: ${CLIENT_NAMES[0]}
@@ -229,6 +234,7 @@ echo -e "${GREEN}"
 echo "============================================================"
 echo "          Hysteria2 успешно установлен и запущен"
 echo "          Сервер максимально защищен (IPv4)"
+echo "          Добавлена поддержка строгих клиентов (pinSHA256)"
 echo "============================================================"
 echo -e "${NC}"
 
@@ -247,11 +253,11 @@ echo
 for i in {0..3}; do
     echo -e "${GREEN}=== Клиент $(($i+1)) (${CLIENT_NAMES[$i]}) ===${NC}"
     echo -e "${CYAN}Пароль:${NC} ${CLIENT_PASSES[$i]}"
-    echo -e "${CYAN}URI (для быстрого импорта):${NC}"
+    echo -e "${CYAN}URI (для Hiddify / Shadowrocket / Karing):${NC}"
     echo "hysteria2://${CLIENT_NAMES[$i]}:${CLIENT_PASSES[$i]}@${SERVER_IP}:${HY2_PORT}/?obfs=salamander&obfs-password=${OBFS_PASS}&sni=www.microsoft.com&insecure=1"
     echo
     
-    echo -e "${CYAN}JSON для Hiddify (вручную):${NC}"
+    echo -e "${CYAN}JSON (для v2rayN / NekoRay с поддержкой pinSHA256):${NC}"
     cat << EOF
 {
   "type": "hysteria2",
@@ -265,7 +271,8 @@ for i in {0..3}; do
   "tls": {
     "enabled": true,
     "server_name": "www.microsoft.com",
-    "insecure": true
+    "insecure": true,
+    "pinSHA256": "${PIN_SHA256}"
   },
   "up_mbps": 100,
   "down_mbps": 500
@@ -274,7 +281,7 @@ EOF
     echo "------------------------------------------------------------"
 done
 
-echo -e "${YELLOW}Важно:${NC} В клиенте обязательно включи Insecure / Skip Certificate Verify"
+echo -e "${YELLOW}Важно:${NC} Для URI-ссылок используется insecure=1. Для JSON добавлен pinSHA256 для совместимости с Xray-core 26.2.6+"
 echo
 echo -e "${CYAN}Данные также сохранены в:${NC} ${INFO_FILE}"
 echo
