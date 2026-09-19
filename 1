@@ -29,16 +29,13 @@ info "Устанавливаю fail2ban и unattended-upgrades..."
 apt-get update -qq
 apt-get install -y -qq curl openssl ca-certificates fail2ban unattended-upgrades > /dev/null
 
-# Настройка автоматических обновлений безопасности
 echo 'Unattended-Upgrade::Allowed-Origins:: "${distro_id}:${distro_codename}-security";' > /etc/apt/apt.conf.d/50unattended-upgrades
 systemctl enable --now unattended-upgrades
 systemctl enable --now fail2ban
 
-# Спрашиваем про отключение SSH
 echo
 warn "⚠️  ВНИМАНИЕ: Ты можешь полностью отключить SSH-сервер."
 warn "После этого войти на сервер можно будет ТОЛЬКО через VNC/веб-консоль хостинга."
-warn "Убедись, что ты знаешь root-пароль и консоль хостинга работает исправно!"
 read -p "Отключить SSH полностью? (y/N): " DISABLE_SSH
 if [[ "$DISABLE_SSH" =~ ^[Yy]$ ]]; then
     info "Останавливаю и отключаю SSH..."
@@ -55,14 +52,17 @@ fi
 # ====================== Выбор порта ======================
 echo
 info "Выбор порта для Hysteria2"
-echo "1) Случайный высокий порт (рекомендуется)"
-echo "2) Указать свой порт"
+echo "1) Случайный высокий порт (35000-60000)"
+echo "2) Указать свой порт (РЕКОМЕНДУЕТСЯ 443 для обхода блокировок провайдера)"
 read -p "Выбери [1/2] (по умолчанию 1): " PORT_CHOICE
 PORT_CHOICE=${PORT_CHOICE:-1}
 
 if [[ "$PORT_CHOICE" == "2" ]]; then
-    read -p "Введи UDP порт (30000-60000): " HY2_PORT
-    [[ -z "${HY2_PORT}" || "${HY2_PORT}" -lt 30000 || "${HY2_PORT}" -gt 60000 ]] && error "Некорректный порт. Используйте диапазон 30000-60000"
+    read -p "Введи UDP порт (443 или 30000-60000): " HY2_PORT
+    # Разрешаем порт 443 ИЛИ диапазон 30000-60000
+    if [[ "$HY2_PORT" != "443" ]] && { [[ "${HY2_PORT}" -lt 30000 ]] || [[ "${HY2_PORT}" -gt 60000 ]]; }; then
+        error "Некорректный порт. Используйте 443 или диапазон 30000-60000"
+    fi
 else
     HY2_PORT=$((RANDOM % 25000 + 35000))
 fi
@@ -105,7 +105,7 @@ chmod 600 /etc/hysteria/server.key
 chmod 644 /etc/hysteria/server.crt
 
 # ====================== Конфиг ======================
-info "Пишу конфиг с поддержкой 4-х пользователей (Строго IPv4)..."
+info "Пишу конфиг с поддержкой 4-х пользователей..."
 
 cat > /etc/hysteria/config.yaml << EOF
 listen: 0.0.0.0:${HY2_PORT}
@@ -178,14 +178,12 @@ else
     warn "Firewall не найден. Открой порт ${HY2_PORT}/udp вручную!"
 fi
 
-# ====================== ОПРЕДЕЛЕНИЕ IPv4 АДРЕСА (Строгое) ======================
+# ====================== ОПРЕДЕЛЕНИЕ IPv4 АДРЕСА ======================
 info "Определяю публичный IPv4-адрес сервера..."
-# Флаг -4 принудительно запрашивает только IPv4
 SERVER_IP=$(curl -4s --max-time 5 ifconfig.me || curl -4s --max-time 5 api.ipify.org || curl -4s --max-time 5 icanhazip.com)
 
-# Проверка, что полученный адрес действительно похож на IPv4
 if [[ -z "$SERVER_IP" || ! "$SERVER_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-    error "Не удалось определить корректный IPv4-адрес. Возможно, у сервера нет публичного IPv4 или есть проблемы с сетью."
+    error "Не удалось определить корректный IPv4-адрес."
 fi
 
 ok "IPv4-адрес сервера: ${SERVER_IP}"
@@ -276,13 +274,8 @@ EOF
     echo "------------------------------------------------------------"
 done
 
-echo -e "${YELLOW}Важно:${NC} В клиенте (Hiddify) обязательно включи Insecure / Skip Certificate Verify"
+echo -e "${YELLOW}Важно:${NC} В клиенте обязательно включи Insecure / Skip Certificate Verify"
 echo
 echo -e "${CYAN}Данные также сохранены в:${NC} ${INFO_FILE}"
-echo
-echo -e "${CYAN}Полезные команды:${NC}"
-echo "  systemctl status hysteria-server"
-echo "  journalctl -u hysteria-server -f"
-echo "  cat /root/hy2-info.txt"
 echo
 echo -e "${GREEN}Готово.${NC}"
